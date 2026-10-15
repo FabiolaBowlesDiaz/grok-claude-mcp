@@ -19,6 +19,9 @@ from pathlib import Path
 
 from grok_claude_mcp import tareas
 
+# Fijo a propósito: no se puede cambiar por variable de entorno.
+MODELO = "claude-opus-5-5"
+
 INSTRUCCIONES_EXTRA = """\
 Trabajás sin supervisión: nadie va a responder preguntas durante la tarea.
 - Hacé solo lo que pide la tarea, con el cambio más chico que la resuelva.
@@ -63,7 +66,7 @@ def correr_claude(carpeta: Path, instruccion: str) -> dict:
 
     opciones = ClaudeAgentOptions(
         cwd=str(carpeta),
-        model=os.environ.get("GROK_MCP_MODELO", "claude-opus-5-5"),
+        model=MODELO,
         # dontAsk: lo que no está en allowed_tools se niega, sin quedarse esperando una respuesta.
         permission_mode="dontAsk",
         allowed_tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],

@@ -133,12 +133,15 @@ def test_claude_corre_sin_web_sin_preguntas_y_con_tope_de_gasto(tmp_path, monkey
                             num_turns=3, session_id="s", total_cost_usd=0.75, result="Listo.")
 
     monkeypatch.setattr(claude_agent_sdk, "query", query_falso)
+    monkeypatch.setenv("GROK_MCP_MODELO", "claude-sonnet-5-5")
 
     salida = worker.correr_claude(tmp_path, "Agregá una función")
 
     opciones = vistas["opciones"]
     assert salida == {"ok": True, "resumen": "Listo.", "costo_usd": 0.75}
     assert opciones.cwd == str(tmp_path)
+    # Decisión de Fabiola: siempre Opus 5.5, aunque alguien defina una variable para cambiarlo.
+    assert opciones.model == "claude-opus-5-5"
     # dontAsk: headless no tiene a quién preguntar; lo no permitido se niega en vez de colgarse.
     assert opciones.permission_mode == "dontAsk"
     assert {"WebFetch", "WebSearch"} <= set(opciones.disallowed_tools)

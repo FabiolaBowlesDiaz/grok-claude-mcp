@@ -20,7 +20,7 @@ Grok Bot ──iniciar_tarea(repo, instruccion)──▶ servidor MCP ──▶ 
 El worker hace estos pasos:
 
 1. Clona el repo y crea la branch `grok/<id>`.
-2. Corre Claude Code en modo headless (sin pantalla) con la instrucción.
+2. Corre Claude Code en modo headless (sin pantalla) con la instrucción. El modelo es siempre Claude Opus 5.5 (`claude-opus-5-5`), fijo en el código.
 3. Si hubo cambios, hace commit, sube **solo** la branch `grok/<id>` y abre un PR.
 
 Una tarea tarda varios minutos, más de lo que espera una llamada MCP. Por eso hay tres herramientas y no una: `iniciar_tarea` responde al instante y el trabajo sigue aparte.
@@ -40,7 +40,6 @@ Una tarea tarda varios minutos, más de lo que espera una llamada MCP. Por eso h
 | `ANTHROPIC_API_KEY` | Sí | API key de Claude Console. Si es de la organización vinculada al plan Max, el uso sale del crédito mensual. |
 | `GITHUB_TOKEN` | Sí | Token *fine-grained* de GitHub con acceso **solo** a los repos permitidos. Permisos: *Contents* lectura y escritura, *Pull requests* lectura y escritura. |
 | `GROK_MCP_REPOS_PERMITIDOS` | Sí | Repos donde Claude Code puede trabajar, separados por coma. Ejemplo: `FabiolaBowlesDiaz/grok-claude-sandbox`. |
-| `GROK_MCP_MODELO` | No | Modelo de Claude. Por defecto `claude-opus-5-5`. `claude-sonnet-5-5` cuesta la mitad. |
 | `GROK_MCP_TOPE_USD` | No | Gasto máximo por tarea, en US$. Por defecto `5`. |
 | `GROK_MCP_TIMEOUT_MIN` | No | Minutos máximos por tarea. Por defecto `30`. |
 | `GROK_MCP_DIR` | No | Carpeta de estado, clones y logs. Por defecto `~/.grok-claude-mcp`. |
