@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -32,6 +33,8 @@ Trabajás sin supervisión: nadie va a responder preguntas durante la tarea.
 """
 
 _AUTOR_GIT = ["-c", "user.name=grok-claude-mcp", "-c", "user.email=grok-claude-mcp@users.noreply.github.com"]
+# Solo las branches que crea este MCP (grok/<id de tarea>). Nunca main ni branches de personas.
+_PATRON_RAMA_GROK = re.compile(r"grok/[0-9a-f]{12}")
 
 
 def _entorno_git(token: str) -> dict:
@@ -102,12 +105,11 @@ def correr_claude(carpeta: Path, instruccion: str) -> dict:
     }
 
 
-def crear_pr_github(repo: str, rama: str, base: str, titulo: str, cuerpo: str, token: str) -> str:
-    """Abre el PR con la API de GitHub y devuelve su URL."""
+def _api_github(metodo: str, ruta: str, token: str, datos: dict | None = None) -> dict:
     pedido = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/pulls",
-        data=json.dumps({"title": titulo, "head": rama, "base": base, "body": cuerpo}).encode(),
-        method="POST",
+        f"https://api.github.com/{ruta}",
+        data=json.dumps(datos).encode() if datos is not None else None,
+        method=metodo,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -116,9 +118,46 @@ def crear_pr_github(repo: str, rama: str, base: str, titulo: str, cuerpo: str, t
     )
     try:
         with urllib.request.urlopen(pedido, timeout=30) as respuesta:
-            return json.load(respuesta)["html_url"]
+            return json.load(respuesta)
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"GitHub respondió {error.code} al abrir el PR: {error.read().decode()[:300]}") from error
+        raise RuntimeError(f"GitHub respondió {error.code} a {metodo} {ruta}: {error.read().decode()[:300]}") from error
+
+
+def crear_pr_github(repo: str, rama: str, base: str, titulo: str, cuerpo: str, token: str) -> str:
+    """Abre el PR con la API de GitHub y devuelve su URL."""
+    datos = {"title": titulo, "head": rama, "base": base, "body": cuerpo}
+    return _api_github("POST", f"repos/{repo}/pulls", token, datos)["html_url"]
+
+
+def leer_pr_github(repo: str, numero: int, token: str) -> dict:
+    """Datos del PR tal como los devuelve la API de GitHub (branch, base, estado, URL)."""
+    return _api_github("GET", f"repos/{repo}/pulls/{numero}", token)
+
+
+def comentar_pr_github(repo: str, numero: int, cuerpo: str, token: str) -> None:
+    _api_github("POST", f"repos/{repo}/issues/{numero}/comments", token, {"body": cuerpo})
+
+
+def _rama_continuable(repo: str, numero: int, pr: dict) -> tuple[str, str]:
+    """Branch y base de un PR que este MCP puede continuar. Si no puede, explica por qué."""
+    rama = pr["head"]["ref"]
+    repo_rama = (pr["head"].get("repo") or {}).get("full_name", "")
+    if not _PATRON_RAMA_GROK.fullmatch(rama):
+        raise RuntimeError(f"El PR #{numero} usa la branch {rama!r}. "
+                           "Solo se continúan branches grok/<id> abiertas por grok-claude-mcp")
+    if repo_rama.lower() != repo.lower():
+        raise RuntimeError(f"La branch del PR #{numero} vive en otro repo ({repo_rama or 'borrado'}), no en {repo}")
+    if pr["state"] != "open":
+        raise RuntimeError(f"El PR #{numero} está {pr['state']}: solo se continúan PRs abiertos")
+    return rama, pr["base"]["ref"]
+
+
+def _contexto_ronda(numero: int, rama: str, base: str) -> str:
+    return (
+        f"Esta tarea es una ronda de correcciones sobre el PR #{numero}. Ya estás en su branch {rama}, "
+        f"que tiene los cambios de rondas anteriores (mirá `git log origin/{base}..HEAD`). "
+        "Tu último mensaje se publica como comentario en el PR.\n\n"
+    )
 
 
 def _titulo_pr(instruccion: str) -> str:
@@ -128,22 +167,35 @@ def _titulo_pr(instruccion: str) -> str:
 
 
 def ejecutar(tarea_id: str, *, agente=correr_claude, publicar_pr=crear_pr_github,
+             leer_pr=leer_pr_github, comentar_pr=comentar_pr_github,
              url_base: str = "https://github.com") -> dict:
     tarea = tareas.leer(tareas.validar_id(tarea_id))
     # Se saca del entorno antes de lanzar a Claude Code: el agente nunca ve el token.
     token = os.environ.pop("GITHUB_TOKEN", "")
     carpeta = tareas.directorio_base() / "trabajo" / tarea_id
-    rama = f"grok/{tarea_id}"
+    url_repo = f"{url_base}/{tarea['repo']}.git"
+    numero_pr = tarea.get("pr_existente")
+    instruccion = tarea["instruccion"]
     costo = None
 
     try:
         tareas.actualizar(tarea_id, estado="en_curso", etapa="clonando")
-        _git("clone", f"{url_base}/{tarea['repo']}.git", str(carpeta), token=token)
-        base = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=carpeta)
-        _git("checkout", "-b", rama, cwd=carpeta)
+        if numero_pr:
+            # Ronda de correcciones: misma branch y mismo PR, nada nuevo.
+            pr = leer_pr(tarea["repo"], numero_pr, token)
+            rama, base = _rama_continuable(tarea["repo"], numero_pr, pr)
+            _git("clone", "--branch", rama, url_repo, str(carpeta), token=token)
+            instruccion = _contexto_ronda(numero_pr, rama, base) + instruccion
+        else:
+            rama = f"grok/{tarea_id}"
+            _git("clone", url_repo, str(carpeta), token=token)
+            base = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=carpeta)
+            _git("checkout", "-b", rama, cwd=carpeta)
+        # Punto de partida: lo que Claude Code agregue se cuenta desde acá, no desde la base.
+        inicio = _git("rev-parse", "HEAD", cwd=carpeta)
 
         tareas.actualizar(tarea_id, etapa="claude_trabajando", rama=rama)
-        salida = agente(carpeta, tarea["instruccion"])
+        salida = agente(carpeta, instruccion)
         costo = salida.get("costo_usd")
         if not salida["ok"]:
             return tareas.actualizar(tarea_id, estado="fallida", etapa="claude",
@@ -155,18 +207,23 @@ def ejecutar(tarea_id: str, *, agente=correr_claude, publicar_pr=crear_pr_github
         _git("add", "-A", cwd=carpeta)
         if _git("status", "--porcelain", cwd=carpeta):
             _git(*_AUTOR_GIT, "commit", "-m", _titulo_pr(tarea["instruccion"]), cwd=carpeta)
-        if _git("rev-list", "--count", f"{base}..HEAD", cwd=carpeta) == "0":
+        if _git("rev-list", "--count", f"{inicio}..HEAD", cwd=carpeta) == "0":
             return tareas.actualizar(tarea_id, estado="terminada", etapa="sin_cambios",
                                      resumen=salida["resumen"], costo_usd=costo, pr_url=None)
 
         tareas.actualizar(tarea_id, etapa="publicando")
         # Refspec explícito: solo se empuja la branch de la tarea, nunca la base.
+        # Sin --force: si alguien más subió commits a la branch, el push falla y no se pisa nada.
         _git("push", "origin", f"refs/heads/{rama}:refs/heads/{rama}", cwd=carpeta, token=token)
         cuerpo = (
             f"{salida['resumen']}\n\n---\n"
             f"Tarea `{tarea_id}` delegada por Grok Bot vía grok-claude-mcp."
             + (f" Costo: US${costo:.2f}." if costo is not None else "")
         )
+        if numero_pr:
+            comentar_pr(tarea["repo"], numero_pr, cuerpo, token)
+            return tareas.actualizar(tarea_id, estado="terminada", etapa="pr_actualizado",
+                                     resumen=salida["resumen"], costo_usd=costo, pr_url=pr["html_url"])
         pr_url = publicar_pr(tarea["repo"], rama, base, _titulo_pr(tarea["instruccion"]), cuerpo, token)
         return tareas.actualizar(tarea_id, estado="terminada", etapa="pr_abierto",
                                  resumen=salida["resumen"], costo_usd=costo, pr_url=pr_url)

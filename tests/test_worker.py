@@ -33,24 +33,53 @@ def remoto(tmp_path, monkeypatch):
     _git("commit", "-m", "inicial", cwd=semilla)
     _git("push", str(bare), "main", cwd=semilla)
 
-    def ejecutar(agente, publicar_pr=None):
+    def ejecutar(agente, publicar_pr=None, pr_existente=None, leer_pr=None, comentar_pr=None):
         tarea_id = tareas.guardar({
             "id": tareas.nuevo_id(),
             "repo": REPO,
             "instruccion": "Agregá una función triple",
+            "pr_existente": pr_existente,
             "estado": "en_cola",
             "iniciada": tareas.ahora().isoformat(timespec="seconds"),
         })["id"]
-        publicar_pr = publicar_pr or (lambda *args: pytest.fail("no debía abrir un PR"))
-        return worker.ejecutar(tarea_id, agente=agente, publicar_pr=publicar_pr,
+        no_debia = lambda accion: lambda *args: pytest.fail(f"no debía {accion}")  # noqa: E731
+        return worker.ejecutar(tarea_id, agente=agente,
+                               publicar_pr=publicar_pr or no_debia("abrir un PR"),
+                               leer_pr=leer_pr or no_debia("leer un PR"),
+                               comentar_pr=comentar_pr or no_debia("comentar un PR"),
                                url_base=(tmp_path / "remotos").as_posix())
+
+    def ramas():
+        return _git("branch", "--format=%(refname:short)", cwd=bare).split()
+
+    def subir_commit(rama, contenido):
+        """Otra persona (o una ronda anterior) sube un commit a `rama` en el remoto."""
+        _git("fetch", str(bare), "+refs/heads/*:refs/remotes/origin/*", cwd=semilla)
+        _git("checkout", "-B", rama, f"origin/{rama}" if rama in ramas() else "main", cwd=semilla)
+        (semilla / "calculos.py").write_text(contenido)
+        _git("commit", "-am", f"commit en {rama}", cwd=semilla)
+        _git("push", str(bare), rama, cwd=semilla)
+        _git("checkout", "main", cwd=semilla)
 
     return {
         "ejecutar": ejecutar,
+        "subir_commit": subir_commit,
         "main": lambda: _git("rev-parse", "main", cwd=bare),
-        "ramas": lambda: _git("branch", "--format=%(refname:short)", cwd=bare).split(),
+        "punta": lambda rama: _git("rev-parse", rama, cwd=bare),
+        "ramas": ramas,
         "archivo": lambda rama: _git("show", f"{rama}:calculos.py", cwd=bare),
     }
+
+
+RAMA_GROK = "grok/0123456789ab"
+DOBLE_Y_TRIPLE = "def doble(x):\n    return 2 * x\n\n\ndef triple(x):\n    return 3 * x\n"
+
+
+def _pr(rama=RAMA_GROK, repo=REPO, estado="open"):
+    """Un PR como lo devuelve la API de GitHub, con solo los campos que usa el worker."""
+    return {"state": estado, "html_url": f"https://github.com/{REPO}/pull/7",
+            "head": {"ref": rama, "repo": {"full_name": repo} if repo else None},
+            "base": {"ref": "main"}}
 
 
 def test_tarea_exitosa_publica_solo_la_branch_de_la_tarea_y_abre_pr(remoto):
@@ -122,6 +151,71 @@ def test_si_claude_cambia_de_branch_no_se_publica_nada(remoto):
 
     assert tarea["estado"] == "fallida" and "cambió de branch" in tarea["error"]
     assert remoto["main"]() == main_antes and remoto["ramas"]() == ["main"]
+
+
+def test_ronda_de_correcciones_suma_un_commit_al_mismo_pr_sin_abrir_otro(remoto):
+    # QA revisa un PR y pide correcciones: el arreglo tiene que aparecer en ese PR, no en uno nuevo.
+    remoto["subir_commit"](RAMA_GROK, DOBLE_Y_TRIPLE)
+    ronda_anterior = remoto["punta"](RAMA_GROK)
+    main_antes = remoto["main"]()
+    vistos, comentarios = {}, []
+
+    def agente(carpeta, instruccion):
+        vistos["instruccion"] = instruccion
+        vistos["archivo"] = (carpeta / "calculos.py").read_text()
+        (carpeta / "calculos.py").write_text(DOBLE_Y_TRIPLE + "\n\ndef cuadruple(x):\n    return 4 * x\n")
+        return {"ok": True, "resumen": "Agregué cuadruple().", "costo_usd": 0.2}
+
+    tarea = remoto["ejecutar"](
+        agente, pr_existente=7,
+        leer_pr=lambda repo, numero, token: _pr(),
+        comentar_pr=lambda repo, numero, cuerpo, token: comentarios.append((repo, numero, cuerpo)),
+    )
+
+    assert (tarea["estado"], tarea["etapa"]) == ("terminada", "pr_actualizado")
+    assert tarea["rama"] == RAMA_GROK and tarea["pr_url"] == "https://github.com/duenia/sandbox/pull/7"
+    # Claude Code parte de lo que ya tenía el PR y sabe que es una ronda de correcciones.
+    assert "triple" in vistos["archivo"] and "PR #7" in vistos["instruccion"]
+    # El commit nuevo va encima de la ronda anterior, en la misma branch. No aparece otra branch.
+    assert "cuadruple" in remoto["archivo"](RAMA_GROK)
+    assert remoto["punta"](f"{RAMA_GROK}~1") == ronda_anterior
+    assert set(remoto["ramas"]()) == {RAMA_GROK, "main"} and remoto["main"]() == main_antes
+    # QA ve en el PR qué se corrigió y cuánto costó.
+    [(repo, numero, cuerpo)] = comentarios
+    assert (repo, numero) == (REPO, 7)
+    assert "Agregué cuadruple()." in cuerpo and "US$0.20" in cuerpo
+
+
+@pytest.mark.parametrize("pr, motivo", [
+    (_pr(rama="main"), "grok/<id>"),                 # nunca se escribe sobre main
+    (_pr(rama="pedro/arreglo-login"), "grok/<id>"),  # ni sobre la branch de una persona
+    (_pr(rama="grok/a-mano"), "grok/<id>"),          # ni sobre una grok/ que no abrió este MCP
+    (_pr(repo="otra-cuenta/sandbox"), "otro repo"),  # fork: el push iría a una branch distinta a la del PR
+    (_pr(estado="closed"), "abiertos"),              # cerrado o mergeado: ya nadie lo revisa
+], ids=["main", "branch-de-persona", "grok-a-mano", "fork", "cerrado"])
+def test_no_se_continua_un_pr_que_no_abrio_el_mcp_o_que_no_esta_abierto(remoto, pr, motivo):
+    main_antes = remoto["main"]()
+
+    tarea = remoto["ejecutar"](lambda *args: pytest.fail("Claude Code no debía correr"),
+                               pr_existente=7, leer_pr=lambda *args: pr)
+
+    assert tarea["estado"] == "fallida" and motivo in tarea["error"]
+    assert remoto["main"]() == main_antes and remoto["ramas"]() == ["main"]
+
+
+def test_ronda_no_pisa_commits_que_otra_persona_subio_mientras_claude_trabajaba(remoto):
+    # El push nunca es forzado: si Designer subió un arreglo a la branch del PR, ese arreglo se conserva.
+    remoto["subir_commit"](RAMA_GROK, DOBLE_Y_TRIPLE)
+
+    def agente(carpeta, instruccion):
+        remoto["subir_commit"](RAMA_GROK, DOBLE_Y_TRIPLE + "# arreglo de Designer\n")
+        (carpeta / "calculos.py").write_text("cambio de Claude")
+        return {"ok": True, "resumen": "Listo.", "costo_usd": 0.1}
+
+    tarea = remoto["ejecutar"](agente, pr_existente=7, leer_pr=lambda *args: _pr())
+
+    assert tarea["estado"] == "fallida" and "push" in tarea["error"]
+    assert "arreglo de Designer" in remoto["archivo"](RAMA_GROK)
 
 
 def test_claude_corre_sin_web_sin_preguntas_y_con_tope_de_gasto(tmp_path, monkeypatch):
