@@ -46,6 +46,35 @@ def test_rechaza_repos_fuera_de_la_lista_permitida(lanzados):
     assert not (tareas.directorio_base() / "tareas").exists()
 
 
+def test_pr_existente_es_opcional_para_no_romper_a_quien_ya_llama_sin_el():
+    herramientas = {herramienta.name: herramienta for herramienta in asyncio.run(servidor.mcp.list_tools())}
+    esquema = herramientas["iniciar_tarea"].input_schema
+    assert "pr_existente" in esquema["properties"]
+    assert set(esquema["required"]) == {"repo", "instruccion"}
+
+
+def test_ronda_de_correcciones_deja_el_numero_de_pr_para_el_worker(lanzados):
+    tarea_id = servidor.iniciar_tarea(REPO_OK, "El botón quedó desalineado", pr_existente=12)["id"]
+
+    assert tareas.leer(tarea_id)["pr_existente"] == 12
+    assert len(lanzados) == 1
+
+
+def test_ronda_de_correcciones_no_saltea_la_lista_de_repos_permitidos(lanzados):
+    # Continuar un PR no es una puerta trasera: un repo fuera de la lista se rechaza igual.
+    with pytest.raises(ToolError, match="GROK_MCP_REPOS_PERMITIDOS"):
+        servidor.iniciar_tarea("FabiolaBowlesDiaz/vitalia-tablas", "Corregí el reporte", pr_existente=3)
+    assert lanzados == []
+
+
+@pytest.mark.parametrize("numero", [0, -4])
+def test_un_numero_de_pr_imposible_se_rechaza_al_instante(lanzados, numero):
+    # Grok Bot recibe el error en la misma llamada, sin lanzar un worker que va a fallar.
+    with pytest.raises(ToolError, match="pr_existente"):
+        servidor.iniciar_tarea(REPO_OK, "Corregí el botón", pr_existente=numero)
+    assert lanzados == []
+
+
 def test_si_falta_una_variable_dice_cual_sin_mostrar_secretos(lanzados, monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN")
     with pytest.raises(ToolError) as error:

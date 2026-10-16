@@ -49,11 +49,16 @@ def _marcar_si_colgada(tarea: dict) -> dict:
 
 
 @mcp.tool()
-def iniciar_tarea(repo: str, instruccion: str) -> dict:
+def iniciar_tarea(repo: str, instruccion: str, pr_existente: int | None = None) -> dict:
     """Delega una tarea de desarrollo a Claude Code.
 
     Claude Code clona `repo` (formato "dueño/nombre"), trabaja en una branch nueva
     y, si cambia archivos, abre un PR. Solo se aceptan los repos permitidos.
+
+    Para una ronda de correcciones sobre un PR que abrió esta herramienta, pasá su
+    número en `pr_existente`: Claude Code trabaja en la misma branch `grok/...`,
+    suma un commit y comenta el PR, sin abrir otro.
+
     La tarea tarda varios minutos: guardá el `id` y consultá con `estado_tarea`.
     """
     faltan = tareas.variables_faltantes()
@@ -71,11 +76,15 @@ def iniciar_tarea(repo: str, instruccion: str) -> dict:
         raise ToolError("La instrucción está vacía")
     if len(instruccion) > _MAX_INSTRUCCION:
         raise ToolError(f"La instrucción supera {_MAX_INSTRUCCION} caracteres")
+    # Que la branch del PR sea grok/<id> lo verifica el worker contra GitHub, antes de clonar.
+    if pr_existente is not None and pr_existente < 1:
+        raise ToolError(f"pr_existente inválido: {pr_existente}. Va el número del PR, por ejemplo 12")
 
     tarea = tareas.guardar({
         "id": tareas.nuevo_id(),
         "repo": repo,
         "instruccion": instruccion,
+        "pr_existente": pr_existente,
         "estado": "en_cola",
         "etapa": "en_cola",
         "iniciada": tareas.ahora().isoformat(timespec="seconds"),
